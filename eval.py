@@ -8,13 +8,17 @@ import time
 import torch.nn.utils as torchutils
 from torch.autograd import Variable
 from utils.logger import Logger
+from sklearn import metrics
+import matplotlib.pylab as plt
 import os
 import numpy as np
 
 if __name__ == '__main__':
 
     # Hyper Parameters
-    parser.add_argument('--batch_size', type=int, default=16, help='training batch size')
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--batch_size', type=int, default=8, help='training batch size')
+    parser.add_argument('--test_batch_size', type=int, default=8, help='testing batch size')
     parser.add_argument('--time_depth', type=int, default=15, help='number of time frames in each video\audio sample')
     parser.add_argument('--workers', type=int, default=0, help='num workers for data loading')
     parser.add_argument('--print_freq', type=int, default=50, help='freq of printing stats')
@@ -23,8 +27,8 @@ if __name__ == '__main__':
     parser.add_argument('--use_mcb', action='store_true', help='wether to use MCB or concat')
     parser.add_argument('--mcb_output_size', type=int, default=1024, help='the size of the MCB outputl')
     parser.add_argument('--debug', action='store_true', help='print debug outputs')
-    parser.add_argument('--arch', type=str, default='AV', help='which modality to train - Video\Audio\AV')
-    parser.add_argument('--pre_train', type=str, default='', help='path to the pre-trained network')
+    parser.add_argument('--arch', type=str, default='Video', help='which modality to train - Video\Audio\AV')
+    parser.add_argument('--pre_train', type=str, default='/home/rczheng/End-to-End-VAD/saved_models/Video/acc_0.696_epoch_027_arch_Video.pkl', help='path to the pre-trained network')
     args = parser.parse_args()
     print(args, end='\n\n')
 
@@ -71,6 +75,7 @@ if __name__ == '__main__':
 
     all_pred = []
     all_gt = []
+    all_pre_index = []
 
     for i, data in enumerate(test_loader):
 
@@ -96,14 +101,40 @@ if __name__ == '__main__':
         loss = criterion(output.squeeze(), target_var)
 
         # measure accuracy and record loss
-        _, predicted = torch.max(output.data, 1)
+        pre_index, predicted = torch.max(output.data, 1)
+        # print(pre_index)
         accuracy = (predicted == target.squeeze().cuda()).sum().type(torch.FloatTensor)
         accuracy.mul_((100.0 / args.test_batch_size))
         test_loss.update(loss.item(), args.test_batch_size)
         test_acc.update(accuracy.item(), args.test_batch_size)
 
+        target = target.squeeze().cpu()
+        targer = target.tolist()
+        predicted = predicted.cpu()
+        predicted = predicted.tolist()
+        pre_index = pre_index.cpu().tolist()
+        all_pred.extend(predicted)
+        all_gt.extend(target)
+        all_pre_index.extend(pre_index)
+
         if i % args.print_freq == 0:
             print('Test: [{0}/{1}]'.format(i, len(test_loader)))
 
     print('Test finished.')
-    print('final loss on test set is {} and final accuracy is {}'.format(loss_test.avg,top1_test.avg))
+    print('final loss on test set is {} and final accuracy is {}'.format(test_loss.avg,test_acc.avg))
+
+    fpr, tpr, thresholds = metrics.roc_curve(all_gt, all_pre_index, pos_label=1)
+    roc_auc = metrics.auc(fpr, tpr)
+    print(roc_auc)
+
+    plt.figure()
+    plt.plot(fpr, tpr, 'b',label='AUC = %0.3f'% roc_auc)
+    plt.legend(loc='lower right')
+    # plt.plot([0, 1], [0, 1], 'r--')
+    plt.xlim([-0.1, 1.1])
+    plt.ylim([-0.1, 1.1])
+    plt.xlabel('False Positive Rate') #横坐标是fpr
+    plt.ylabel('True Positive Rate')  #纵坐标是tpr
+    plt.title('Receiver operating characteristic example')
+    plt.savefig('ROC2.png')
+    # plt.show()

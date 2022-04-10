@@ -1,66 +1,60 @@
 from __future__ import print_function, division
 import argparse
+import math
+import os
+import time
+
 import torch
 import torch.nn as nn
-from utils import utils as utils
 from torch.utils.data import DataLoader
-import time
-import torch.nn.utils as torchutils
-from torch.autograd import Variable
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+
+from networks.Video_Net import DeepVAD_video
 from utils.logger import Logger
-import os
+from datasets import VideoDataset
+from utils import utils as utils
 
 if __name__ == '__main__':
 
     # Hyper Parameters
     parser = argparse.ArgumentParser()
-    parser.add_argument('--num_epochs', type=int, default=20, help='number of epochs')
-    parser.add_argument('--batch_size', type=int, default=16, help='training batch size')
-    parser.add_argument('--test_batch_size', type=int, default=16, help='test batch size')
-    parser.add_argument('--time_depth', type=int, default=15, help='number of time frames in each video\audio sample')
+    parser.add_argument('--logdir', type=str, default='logs', help='log directory')
+    parser.add_argument('--outdir', type=str, default='outputs', help='output directory')
+    parser.add_argument('--num_epochs', type=int, default=51, help='number of epochs')
+    parser.add_argument('--batch_size', type=int, default=128, help='training batch size')
+    parser.add_argument('--time_depth', type=int, default=15, help='number of time frames in each video/audio sample')
     parser.add_argument('--workers', type=int, default=0, help='num workers for data loading')
     parser.add_argument('--lr', type=float, default=0.001, help='learning rate')
-    parser.add_argument('--weight_decay', type=float, default=1e-5, help='optimizer weight decay factor')
+    parser.add_argument('--weight_decay', type=float, default=1e-6, help='optimizer weight decay factor')
     parser.add_argument('--momentum', type=float, default=0.9, help='optimizer momentum factor')
     parser.add_argument('--save_freq', type=int, default=1, help='freq of saving the model')
-    parser.add_argument('--print_freq', type=int, default=50, help='freq of printing stats')
-    parser.add_argument('--seed', type=int, default=44974274, help='random seed')
-    parser.add_argument('--lstm_layers', type=int, default=2, help='number of lstm layers in the model')
-    parser.add_argument('--lstm_hidden_size', type=int, default=1024, help='number of neurons in each lstm layer in the model')
-    parser.add_argument('--use_mcb', action='store_true', help='wether to use MCB or concat')
-    parser.add_argument('--mcb_output_size', type=int, default=1024, help='the size of the MCB outputl')
-    parser.add_argument('--debug', action='store_true', help='print debug outputs')
-    parser.add_argument('--freeze_layers', action='store_true', help='wether to freeze the first layers of the model')
-    parser.add_argument('--arch', type=str, default='AV', choices=['Audio', 'Video', 'AV'], help='which modality to train - Video\Audio\Multimodal')
+    parser.add_argument('--print_freq', type=int, default=50, help='freq of printing the results')
+    parser.add_argument('--seed', type=int, default=1234, help='random seed')
     parser.add_argument('--pre_train', type=str, default='', help='path to a pre-trained network')
-
     args = parser.parse_args()
     print(args, end='\n\n')
 
+    # Settings
+    torch.backends.cudnn.enabled=True
+    torch.backends.cudnn.benchmark=False
     torch.manual_seed(args.seed)
 
-    # set the logger
-    if not os.path.exists('logs'):
-        os.makedirs('logs')
-    logger = Logger('logs')
+    if torch.cuda.is_available():
+        device = torch.device('cuda')
+    else:
+        device = torch.device('cpu')
+    print('Use Device: ', device)
 
-    # create a saved models folder
-    save_dir = os.path.join('saved_models', args.arch)
-    if not os.path.exists(save_dir):
-        os.makedirs(save_dir)
+    model = DeepVAD_video(device)
+    model = model.to(device)
 
     # create train + val datasets
-    dataset = utils.import_dataset(args)
-
-    train_dataset = dataset(DataDir='data/train/', timeDepth = args.time_depth, is_train=True)
-    val_dataset = dataset(DataDir='data/test/', timeDepth = args.time_depth, is_train=False)
-
+    train_dataset = VideoDataset(DataDir='E2EVAD/train/', timeDepth = args.time_depth, is_train=True)
+    val_dataset = VideoDataset(DataDir='E2EVAD/test/', timeDepth = args.time_depth, is_train=False)
     print('{} samples found, {} train samples and {} test samples.'.format(len(val_dataset)+len(train_dataset),
                                                                            len(train_dataset),
                                                                            len(val_dataset)))
-
     # create the data loaders
-
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size, shuffle=True,
@@ -68,33 +62,40 @@ if __name__ == '__main__':
         drop_last=True)
     val_loader = DataLoader(
         val_dataset,
-        batch_size=args.test_batch_size, shuffle=False,
+        batch_size=args.batch_size, shuffle=False,
         num_workers=args.workers, pin_memory=False,
         drop_last=True)
+    print('{} batches found, {} train batches and {} test batches.'.format(len(val_loader)+len(train_loader),
+                                                                           len(train_loader),
+                                                                           len(val_loader)))
 
-    # import network
-    net = utils.import_network(args)
+    # set the logger
+    if not os.path.exists(args.logdir):
+        os.makedirs(args.logdir)
+    logger = Logger(args.logdir)
 
-    # create optimizer and loss (optionaly assign each class with different weight
+    # create a saved models folder
+    if not os.path.exists(args.outdir):
+        os.makedirs(args.outdir)
+
+    # create loss (optionaly assign each class with different weight
     weight = torch.FloatTensor(2)
     weight[0] = 1  # class 0 - non-speech
     weight[1] = 1  # class 1 - speech
-    criterion = nn.CrossEntropyLoss(weight=weight).cuda()
+    criterion = nn.CrossEntropyLoss(weight=weight).to(device)
 
-    optimizer = torch.optim.SGD(net.parameters(), args.lr, momentum=args.momentum, weight_decay=args.weight_decay)
-
-    scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[2, 5, 8], gamma=0.1)
+    # create optimizer
+    optimizer = torch.optim.Adam(model.parameters(), args.lr, weight_decay=args.weight_decay)
+    scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[20, 40, 60, 80], gamma=0.1)
 
     # init from a saved checkpoint
-
     if args.pre_train is not '':
-        model_name = os.path.join('pre_trained', args.arch, args.pre_train)
-
+        model_name = args.pre_train
         if os.path.isfile(model_name):
             print("=> loading checkpoint '{}'".format(model_name))
             checkpoint = torch.load(model_name)
             pretrained = checkpoint['state_dict']
-            net.load_state_dict(pretrained,strict=False)
+            model.load_state_dict(pretrained,strict=False)
             print("=> loaded checkpoint '{}' (epoch {})"
                   .format(model_name, checkpoint['epoch']))
         else:
@@ -102,69 +103,52 @@ if __name__ == '__main__':
     else:
         print('Training the model from scratch.')
 
-    # freeze layeres
-
-    def freeze_layer(layer):
-        for param in layer.parameters():
-            param.requires_grad = False
-
-    if args.arch == 'Video' and args.freeze_layers == True:
-        freeze_layer(net.features)
-
-    if args.arch == 'Audio' and args.freeze_layers == True:
-        freeze_layer(net.wavenet_en)
-        freeze_layer(net.bn)
-
-    if args.arch == 'AV' and args.freeze_layers == True:
-        freeze_layer(net.features)
-        freeze_layer(net.wavenet_en)
-        freeze_layer(net.bn)
-
     # def test method
     def test():
-
         test_acc  = utils.AverageMeter()
         test_loss = utils.AverageMeter()
+        test_prec = utils.AverageMeter()
+        test_reca = utils.AverageMeter()
+        test_f1 = utils.AverageMeter()
 
-        net.eval()
+        model.eval()
         print('Test started.')
+        
+        with torch.no_grad():
+            for i, data in enumerate(val_loader):
+                input, target = model.parse_batch(data)  
+                output = model(input)
 
-        for i, data in enumerate(val_loader):
+                loss = criterion(output.squeeze(), target)
 
-            states_test = net.init_hidden(is_train=False)
+                # measure accuracy and record loss
+                _, predicted = torch.max(output.data, 1)
+                target = target.squeeze().cpu()
+                predicted = predicted.cpu()
+                accuracy = accuracy_score(target, predicted)
+                precision = precision_score(target, predicted)
+                recall = recall_score(target, predicted)
+                f1score = f1_score(target, predicted)
 
-            if args.arch == 'Video' or args.arch == 'Audio':  # single modality
+                test_loss.update(loss.item(), args.batch_size)
+                test_acc.update(accuracy.item(), args.batch_size)
+                test_prec.update(precision.item(), args.batch_size)
+                test_reca.update(recall.item(), args.batch_size)
+                test_f1.update(f1score.item(), args.batch_size)
 
-                input, target = data  # input is of shape torch.Size([batch, channels, frames, width, height])
-                input_var = Variable(input.unsqueeze(1)).cuda()
-                target_var = Variable(target.squeeze()).cuda()
+                if i>0 and i % args.print_freq == 0:
+                    print('Test: [{0}][{1}/{2}] , \t'
+                      'Loss {loss.avg:.4f} , \t'
+                      'Acc {top1.avg:.3f}, \t'
+                      'precision {prec.avg:.3f}, \t'
+                      'Recall {reca.avg:.3f}, \t'
+                      'F1_score {f1.avg:.3f}, \t'
+                      .format(
+                    epoch, i, len(val_loader), loss=test_loss, top1=test_acc, prec=test_prec, reca=test_reca, f1=test_f1))
 
-                output = net(input_var, states_test)
-
-            else:  # multiple modalities
-
-                audio, video, target = data
-                audio_var = Variable(audio.unsqueeze(1)).cuda()
-                video_var = Variable(video.unsqueeze(1)).cuda()
-                target_var = Variable(target.squeeze()).cuda()
-
-                output = net(audio_var, video_var, states_test)
-
-            loss = criterion(output.squeeze(), target_var)
-
-            # measure accuracy and record loss
-            _, predicted = torch.max(output.data, 1)
-            accuracy = (predicted == target.squeeze().cuda()).sum().type(torch.FloatTensor)
-            accuracy.mul_((100.0 / args.test_batch_size))
-            test_loss.update(loss.item(), args.test_batch_size)
-            test_acc.update(accuracy.item(), args.test_batch_size)
-
-            if i>0 and i % args.print_freq == 0:
-                print('Test: [{0}][{1}/{2}] - loss = {3} , acc = {4}'.format(epoch, i, len(val_loader), test_loss.avg, test_acc.avg))
-
-        net.train()
+        model.train()
         print('Test finished.')
-        return test_acc.avg, test_loss.avg
+        return test_acc.avg, test_loss.avg, test_prec.avg, test_reca.avg, test_f1.avg
 
 
     ### main training loop ###
@@ -175,67 +159,66 @@ if __name__ == '__main__':
 
     for epoch in range(0,args.num_epochs):
 
-        train_loss = utils.AverageMeter()
-        train_acc = utils.AverageMeter()
         batch_time = utils.AverageMeter()
         data_time = utils.AverageMeter()
-
-        # learning rate decay
-        scheduler.step()
-
         end = time.time()
+
+        train_loss = utils.AverageMeter()
+        train_acc = utils.AverageMeter()
+        train_prec = utils.AverageMeter()
+        train_reca = utils.AverageMeter()
+        train_f1 = utils.AverageMeter()
 
         # train for one epoch
         for i, data in enumerate(train_loader):
 
-            states = net.init_hidden(is_train=True)
+            model.train()
+            optimizer.zero_grad()
+            input, target = model.parse_batch(data)
+        
+            # measure data loading time
+            data_time.update(time.time() - end)
 
-            if args.arch == 'Video' or args.arch == 'Audio': # single modality
+            output = model(input)
 
-                input, target = data
-                input_var = Variable(input.unsqueeze(1)).cuda()
-                target_var = Variable(target.squeeze()).cuda()
-
-                # measure data loading time
-                data_time.update(time.time() - end)
-
-                output = net(input_var, states)
-
-            else: # multiple modalities
-
-                audio, video, target = data
-                audio_var = Variable(audio.unsqueeze(1)).cuda()
-                video_var = Variable(video.unsqueeze(1)).cuda()
-                target_var = Variable(target.squeeze()).cuda()
-
-                # measure data loading time
-                data_time.update(time.time() - end)
-
-                output = net(audio_var,video_var, states)
-
-            loss = criterion(output.squeeze(), target_var)
+            loss = criterion(output.squeeze(), target)
+            loss.backward()
 
             # compute gradient and do SGD step
-            net.zero_grad()
-            loss.backward()
-            torchutils.clip_grad_norm_(net.parameters(), 0.5)
-            optimizer.step()
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            if math.isnan(grad_norm):
+                print("grad norm is nan. Do not update model.")
+            else:
+                optimizer.step()
 
             # measure elapsed time
-            batch_time.update(time.time() - end)
-            end = time.time()
+            batch_time.update(time.time() - end) # actually step time
 
             # measure accuracy and record loss
             _, predicted = torch.max(output.data, 1)
-            accuracy = (predicted == target.squeeze().cuda()).sum().type(torch.FloatTensor)
-            accuracy.mul_((100.0 / args.batch_size))
+            target = target.squeeze().cpu()
+            predicted = predicted.cpu()
+
+            accuracy = accuracy_score(target, predicted)
+            precision = precision_score(target, predicted)
+            recall = recall_score(target, predicted)
+            f1score = f1_score(target, predicted)
+
             train_loss.update(loss.item(), args.batch_size)
             train_acc.update(accuracy.item(), args.batch_size)
+            train_prec.update(precision.item(), args.batch_size)
+            train_reca.update(recall.item(), args.batch_size)
+            train_f1.update(f1score.item(), args.batch_size)
 
             # tensorboard logging
             logger.scalar_summary('train loss', loss.item(), step + 1)
             logger.scalar_summary('train accuracy', accuracy.item(), step + 1)
+            logger.scalar_summary('train precision', precision.item(), step + 1)
+            logger.scalar_summary('train recall', recall.item(), step + 1)
+            logger.scalar_summary('train f1score', f1score.item(), step + 1)
             step+=1
+
+            end = time.time()
 
             if i > 0 and i % args.print_freq == 0:
                 print('Epoch: [{0}][{1}/{2}] , \t'
@@ -243,17 +226,25 @@ if __name__ == '__main__':
                       'Time {batch_time.avg:.3f} , \t'
                       'Data {data_time.avg:.3f} , \t'
                       'Loss {loss.avg:.4f} , \t'
-                      'Acc {top1.avg:.3f}'.format(
+                      'Acc {top1.avg:.3f}, \t'
+                      'precision {prec.avg:.3f}, \t'
+                      'Recall {reca.avg:.3f}, \t'
+                      'F1_score {f1.avg:.3f}, \t'
+                      .format(
                     epoch, i, len(train_loader), optimizer.param_groups[0]['lr'], batch_time=batch_time,
-                    data_time=data_time, loss=train_loss, top1=train_acc))
+                    data_time=data_time, loss=train_loss, top1=train_acc, prec=train_prec, reca=train_reca, f1=train_f1))
 
         # evaluate on validation set
-        accuracy, loss = test()
-
+        accuracy, loss, precision, recall, f1score = test()
         # logger
         logger.scalar_summary('Test Accuracy', accuracy, epoch)
         logger.scalar_summary('Test Loss ', loss, epoch)
+        logger.scalar_summary('Test Precision ', precision, epoch)
+        logger.scalar_summary('Test Recall ', recall, epoch)
+        logger.scalar_summary('Test F1Score ', f1score, epoch)
         logger.scalar_summary('LR ', optimizer.param_groups[0]['lr'], epoch)
+
+        scheduler.step()
 
         # remember best prec@1 and save checkpoint
         is_best = False
@@ -267,15 +258,12 @@ if __name__ == '__main__':
         print('Best accuracy so far is: {}% , at epoch #{}'.format(best_accuracy,best_epoch))
 
         if epoch % args.save_freq == 0:
-            checkpoint_name = "%s\\acc_%.3f_epoch_%03d_arch_%s.pkl" % (save_dir, accuracy, epoch, args.arch)
+            checkpoint_name = "%s/acc_%.3f_epoch_%03d.pkl" % (args.outdir, accuracy, epoch)
             utils.save_checkpoint(state={
                 'epoch': epoch,
-                'arch': args.arch,
-                'state_dict': net.state_dict(),
+                'state_dict': model.state_dict(),
                 'accuracy': accuracy,
                 'best_accuracy': best_accuracy,
                 'optimizer': optimizer.state_dict(),
-            }, is_best=is_best,best_accuracy=best_accuracy,filename=checkpoint_name)
-            model_name = "%s\\acc_%.3f_epoch_%03d_arch_%s_model.pkl" % (save_dir, accuracy, epoch, args.arch)
-
-            torch.save(net, model_name)
+            }, filename=checkpoint_name)
+            

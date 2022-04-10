@@ -1,62 +1,41 @@
 import torch
 import torch.nn as nn
-import torchvision.models as models
-import torch.nn.functional as F
-from torch.autograd import Variable
-from utils.utils import weights_init_normal
+from networks.Encoder import Encoder
 
 # VIDEO only network
 class DeepVAD_video(nn.Module):
 
-    def __init__(self, args):
+    def __init__(self, device):
         super(DeepVAD_video, self).__init__()
+        self.device = device
+        self.build_model()
 
-        resnet = models.resnet18(pretrained=True) # set num_ftrs = 512
-        #resnet = models.resnet34(pretrained=True) # set num_ftrs = 512
+    def build_model(self):
+        self.encoder = Encoder(input_channel=1)
 
-        num_ftrs = 512
-
-        self.lstm_input_size = num_ftrs
-        self.lstm_layers = args.lstm_layers
-        self.lstm_hidden_size = args.lstm_hidden_size
-        self.batch_size = args.batch_size
-        self.test_batch_size = args.test_batch_size
-
-        self.features = nn.Sequential(
-            *list(resnet.children())[:-1]# drop the last FC layer
-        )
-
-        self.lstm_video = nn.LSTM(input_size=self.lstm_input_size,
-                            hidden_size=self.lstm_hidden_size,
-                            num_layers=self.lstm_layers,
+        self.lstm_video = nn.LSTM(input_size=512,
+                            hidden_size=512,
+                            num_layers=2,
                             bidirectional=False)
 
-        self.vad_video = nn.Linear(self.lstm_hidden_size, 2)
+        self.vad_video = nn.Linear(512, 2)
+        
         self.dropout = nn.Dropout(p=0.5)
 
-    def weight_init(self, mean=0.0, std=0.02):
-        for m in self.named_parameters():
-            weights_init_normal(m, mean=mean, std=std)
+    def parse_batch(self, batch):
+        input, target = batch
+        input = input.to(self.device).float()
+        target = target.to(self.device).long()
+        return (input, target)
 
-    def forward(self, x, h):
-        batch,frames,channels,height,width = x.squeeze().size()
-        # Reshape to (batch * seq_len, channels, height, width)
-        x = x.view(batch*frames,channels,height,width)
-        x = self.features(x).squeeze() # output shape - Batch X Features X seq len
-        x = self.dropout(x)
-        # Reshape to (batch , seq_len, Features)
-        x = x.view(batch , frames, -1)
-        # Reshape to (seq_len, batch, Features)
-        x = x.permute(1, 0, 2)
-        out, _ = self.lstm_video(x, h)  # output shape - seq len X Batch X lstm size
-        out = self.dropout(out[-1])  # select last time step. many -> one
-        out = F.sigmoid(self.vad_video(out))
+    def forward(self, input):
+        # print(input.size())
+        encoder_out = self.encoder(input) # output shape - [B, T, 512]
+        # Reshape to (T, B, 512)
+        encoder_out = encoder_out.transpose(0, 1)
+        # output shape - seq len X Batch X lstm size
+        lstm_out, _ = self.lstm_video(encoder_out)  
+        # select last time step. many -> one
+        lstm_out = self.dropout(lstm_out[-1])  
+        out = torch.sigmoid(self.vad_video(lstm_out))
         return out
-
-    def init_hidden(self,is_train):
-        if is_train:
-            return (Variable(torch.zeros(self.lstm_layers, self.batch_size, self.lstm_hidden_size)).cuda(),
-                      Variable(torch.zeros(self.lstm_layers, self.batch_size, self.lstm_hidden_size)).cuda())
-        else:
-            return (Variable(torch.zeros(self.lstm_layers, self.test_batch_size, self.lstm_hidden_size)).cuda(),
-                    Variable(torch.zeros(self.lstm_layers, self.test_batch_size, self.lstm_hidden_size)).cuda())

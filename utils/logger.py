@@ -3,7 +3,6 @@
 import tensorboardX.summary as tf
 import tensorboardX.writer as tf_writer
 import numpy as np
-import os
 import matplotlib.pyplot as plt
 
 try:
